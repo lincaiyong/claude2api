@@ -282,10 +282,35 @@ func HandleMessagesMonica(c *gin.Context) {
 
 	logger.Info(fmt.Sprintf("Processing %d messages", len(req.Messages)))
 
+	// Log system field format and content
+	systemStr := ""
+	if req.System != nil {
+		switch v := req.System.(type) {
+		case string:
+			systemStr = v
+			logger.Info(fmt.Sprintf("System field format: string, length: %d", len(v)))
+		case []interface{}:
+			logger.Info(fmt.Sprintf("System field format: array, length: %d", len(v)))
+			// Convert array to string for processing
+			for i, item := range v {
+				if m, ok := item.(map[string]interface{}); ok {
+					if text, exists := m["text"]; exists {
+						systemStr += fmt.Sprintf("%v", text)
+						logger.Info(fmt.Sprintf("System array[%d]: type=%v, text length=%d", i, m["type"], len(fmt.Sprintf("%v", text))))
+					}
+				}
+			}
+		default:
+			logger.Info(fmt.Sprintf("System field format: unknown type %T", v))
+		}
+	} else {
+		logger.Info("No system field provided")
+	}
+
 	// Process messages into prompt and extract images
 	processor := utils.NewChatRequestProcessor()
 	processor.ProcessMessages(req.Messages)
-	logger.Info(fmt.Sprintf("Processed messages - prompt length: %d, images: %d", processor.Prompt.Len(), len(processor.ImgDataList)))
+	logger.Info(fmt.Sprintf("Processed messages - prompt length: %d, images: %d, system length: %d", processor.Prompt.Len(), len(processor.ImgDataList), len(systemStr)))
 
 	// Get model or use default
 	modelName := getModelOrDefault(req.Model)

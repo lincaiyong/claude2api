@@ -13,7 +13,7 @@ type ClaudeMessagesRequest struct {
 	MaxTokens  int                      `json:"max_tokens"`
 	Messages   []map[string]interface{} `json:"messages"`
 	Stream     bool                     `json:"stream,omitempty"`
-	System     string                   `json:"system,omitempty"`
+	System     interface{}              `json:"system,omitempty"` // Support both string and array formats
 	Tools      []map[string]interface{} `json:"tools,omitempty"`
 	ToolChoice interface{}              `json:"tool_choice,omitempty"`
 }
