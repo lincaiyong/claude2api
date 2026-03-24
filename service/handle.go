@@ -257,3 +257,149 @@ func cleanupConversation(client *core.Client, conversationID string, retry int) 
 	// 只有当所有重试都失败后，才会执行到这里
 	logger.Error(fmt.Sprintf("Cleanup %s conversation %s failed after %d retries", client.SessionKey, conversationID, retry))
 }
+
+// HandleMessagesMonica handles the Claude Messages API endpoint
+func HandleMessagesMonica(c *gin.Context) {
+	// Parse and validate request
+	var req model.ClaudeMessagesRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, ErrorResponse{
+			Error: fmt.Sprintf("Invalid request: %v", err),
+		})
+		return
+	}
+
+	if len(req.Messages) == 0 {
+		c.JSON(http.StatusBadRequest, ErrorResponse{
+			Error: "No messages provided",
+		})
+		return
+	}
+
+	// Process messages into prompt and extract images
+	processor := utils.NewChatRequestProcessor()
+	processor.ProcessMessages(req.Messages)
+
+	// Get model or use default
+	modelName := getModelOrDefault(req.Model)
+	index := config.Sr.NextIndex()
+
+	// Attempt with retry mechanism
+	for i := 0; i < config.ConfigInstance.RetryCount; i++ {
+		index = (index + 1) % len(config.ConfigInstance.Sessions)
+		session, err := config.ConfigInstance.GetSessionForModel(index)
+		if err != nil {
+			logger.Error(fmt.Sprintf("Failed to get session for model %s: %v", modelName, err))
+			logger.Info("Retrying another session")
+			continue
+		}
+
+		logger.Info(fmt.Sprintf("Using session for model %s: %s", modelName, session.SessionKey))
+		if i > 0 {
+			processor.Prompt.Reset()
+			processor.Prompt.WriteString(processor.RootPrompt.String())
+		}
+
+		// Initialize client and process request
+		if handleClaudeMessagesRequest(c, session, modelName, processor, req.Stream) {
+			return // Success, exit the retry loop
+		}
+
+		// If we're here, the request failed - retry with another session
+		logger.Info("Retrying another session")
+	}
+
+	logger.Error("Failed for all retries")
+	c.JSON(http.StatusInternalServerError, ErrorResponse{
+		Error: "Failed to process request after multiple attempts"})
+}
+
+// HandleCountTokens handles the count tokens endpoint
+func HandleCountTokens(c *gin.Context) {
+	// Parse request
+	var req model.CountTokensRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, ErrorResponse{
+			Error: fmt.Sprintf("Invalid request: %v", err),
+		})
+		return
+	}
+
+	if len(req.Messages) == 0 {
+		c.JSON(http.StatusBadRequest, ErrorResponse{
+			Error: "No messages provided",
+		})
+		return
+	}
+
+	// Process messages to estimate token count
+	processor := utils.NewChatRequestProcessor()
+	processor.ProcessMessages(req.Messages)
+
+	// Simple token estimation: characters / 4 (rough approximation)
+	promptLength := processor.Prompt.Len()
+	if req.System != "" {
+		promptLength += len(req.System)
+	}
+	estimatedTokens := promptLength / 4
+
+	// Return count
+	c.JSON(http.StatusOK, model.CountTokensResponse{
+		InputTokens: estimatedTokens,
+	})
+}
+
+func handleClaudeMessagesRequest(c *gin.Context, session config.SessionInfo, modelName string, processor *utils.ChatRequestProcessor, stream bool) bool {
+	// Initialize the Claude client
+	claudeClient := core.NewClient(session.SessionKey, config.ConfigInstance.Proxy, modelName)
+
+	// Get org ID if not already set
+	if session.OrgID == "" {
+		orgId, err := claudeClient.GetOrgID()
+		if err != nil {
+			logger.Error(fmt.Sprintf("Failed to get org ID: %v", err))
+			return false
+		}
+		session.OrgID = orgId
+		config.ConfigInstance.SetSessionOrgID(session.SessionKey, session.OrgID)
+	}
+
+	claudeClient.SetOrgID(session.OrgID)
+
+	// Upload images if any
+	if len(processor.ImgDataList) > 0 {
+		err := claudeClient.UploadFile(processor.ImgDataList)
+		if err != nil {
+			logger.Error(fmt.Sprintf("Failed to upload file: %v", err))
+			return false
+		}
+	}
+
+	// Handle large context if needed
+	if processor.Prompt.Len() > config.ConfigInstance.MaxChatHistoryLength {
+		claudeClient.SetBigContext(processor.Prompt.String())
+		processor.ResetForBigContext()
+		logger.Info(fmt.Sprintf("Prompt length exceeds max limit (%d), using file context", config.ConfigInstance.MaxChatHistoryLength))
+	}
+
+	// Create conversation
+	conversationID, err := claudeClient.CreateConversation()
+	if err != nil {
+		logger.Error(fmt.Sprintf("Failed to create conversation: %v", err))
+		return false
+	}
+
+	// Send message with Claude Messages API response format
+	if _, err := claudeClient.SendMessageClaudeFormat(conversationID, processor.Prompt.String(), stream, c); err != nil {
+		logger.Error(fmt.Sprintf("Failed to send message: %v", err))
+		go cleanupConversation(claudeClient, conversationID, 3)
+		return false
+	}
+
+	// Clean up conversation if enabled
+	if config.ConfigInstance.ChatDelete {
+		go cleanupConversation(claudeClient, conversationID, 3)
+	}
+
+	return true
+}

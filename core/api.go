@@ -231,6 +231,40 @@ func (c *Client) SendMessage(conversationID string, message string, stream bool,
 	return 200, c.HandleResponse(resp.Body, stream, gc)
 }
 
+// SendMessageClaudeFormat sends a message and returns response in Claude Messages API format
+func (c *Client) SendMessageClaudeFormat(conversationID string, message string, stream bool, gc *gin.Context) (int, error) {
+	if c.orgID == "" {
+		return 500, errors.New("organization ID not set")
+	}
+	url := fmt.Sprintf("https://claude.ai/api/organizations/%s/chat_conversations/%s/completion",
+		c.orgID, conversationID)
+	// Create request body with default attributes
+	requestBody := c.defaultAttrs
+	requestBody["prompt"] = message
+	if c.model != "claude-sonnet-4-20250514" {
+		requestBody["model"] = c.model
+	}
+	// Set up streaming response
+	resp, err := c.client.R().DisableAutoReadResponse().
+		SetHeader("referer", fmt.Sprintf("https://claude.ai/chat/%s", conversationID)).
+		SetHeader("accept", "text/event-stream, text/event-stream").
+		SetHeader("anthropic-client-platform", "web_claude_ai").
+		SetHeader("cache-control", "no-cache").
+		SetBody(requestBody).
+		Post(url)
+	if err != nil {
+		return 500, fmt.Errorf("request failed: %w", err)
+	}
+	logger.Info(fmt.Sprintf("Claude response status code: %d", resp.StatusCode))
+	if resp.StatusCode == http.StatusTooManyRequests {
+		return http.StatusTooManyRequests, fmt.Errorf("rate limit exceeded")
+	}
+	if resp.StatusCode != http.StatusOK {
+		return resp.StatusCode, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+	}
+	return 200, c.HandleClaudeMessagesResponse(resp.Body, stream, gc)
+}
+
 // HandleResponse converts Claude's SSE format to OpenAI format and writes to the response writer
 func (c *Client) HandleResponse(body io.ReadCloser, stream bool, gc *gin.Context) error {
 	defer body.Close()
@@ -396,6 +430,70 @@ func (c *Client) HandleResponse(body io.ReadCloser, stream bool, gc *gin.Context
 		// 发送结束标志
 		gc.Writer.Write([]byte("data: [DONE]\n\n"))
 		gc.Writer.Flush()
+	}
+
+	return nil
+}
+
+// HandleClaudeMessagesResponse converts Claude's SSE format to Claude Messages API format
+func (c *Client) HandleClaudeMessagesResponse(body io.ReadCloser, stream bool, gc *gin.Context) error {
+	defer body.Close()
+	// Set headers for streaming
+	if stream {
+		gc.Writer.Header().Set("Content-Type", "text/event-stream")
+		gc.Writer.Header().Set("Cache-Control", "no-cache")
+		gc.Writer.Header().Set("Connection", "keep-alive")
+		gc.Writer.WriteHeader(http.StatusOK)
+		gc.Writer.Flush()
+		// Send stream start events
+		model.SendClaudeStreamStart(gc, c.model)
+	}
+
+	scanner := bufio.NewScanner(body)
+	clientDone := gc.Request.Context().Done()
+	res_all_text := ""
+
+	for scanner.Scan() {
+		select {
+		case <-clientDone:
+			logger.Info("Client closed connection")
+			return nil
+		default:
+		}
+
+		line := scanner.Text()
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		data := line[6:]
+		var event ResponseEvent
+		if err := json.Unmarshal([]byte(data), &event); err == nil {
+			if event.Type == "error" && event.Error.Message != "" {
+				model.ReturnClaudeMessagesResponse(event.Error.Message, stream, gc, c.model)
+				return nil
+			}
+
+			if event.Delta.Type == "text_delta" && event.Delta.Text != "" {
+				res_text := event.Delta.Text
+				res_all_text += res_text
+				if !stream {
+					continue
+				}
+				model.ReturnClaudeMessagesResponse(res_text, stream, gc, c.model)
+				continue
+			}
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("error reading response: %w", err)
+	}
+
+	if !stream {
+		model.ReturnClaudeMessagesResponse(res_all_text, stream, gc, c.model)
+	} else {
+		// Send stream stop events
+		model.SendClaudeStreamStop(gc)
 	}
 
 	return nil

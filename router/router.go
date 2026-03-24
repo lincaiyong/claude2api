@@ -20,6 +20,10 @@ func SetupRoutes(r *gin.Engine) {
 	r.POST("/v1/chat/completions", service.ChatCompletionsHandler)
 	r.GET("/v1/models", service.MoudlesHandler)
 
+	// Claude Messages API endpoints
+	r.POST("/v1/messages", service.HandleMessagesMonica)
+	r.POST("/v1/messages/count_tokens", service.HandleCountTokens)
+
 	if config.ConfigInstance.EnableMirrorApi {
 		r.POST(config.ConfigInstance.MirrorApiPrefix+"/v1/chat/completions", service.MirrorChatHandler)
 		r.GET(config.ConfigInstance.MirrorApiPrefix+"/v1/models", service.MoudlesHandler)
