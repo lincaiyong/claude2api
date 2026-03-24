@@ -260,9 +260,12 @@ func cleanupConversation(client *core.Client, conversationID string, retry int) 
 
 // HandleMessagesMonica handles the Claude Messages API endpoint
 func HandleMessagesMonica(c *gin.Context) {
+	logger.Info("Received Claude Messages API request")
+
 	// Parse and validate request
 	var req model.ClaudeMessagesRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
+		logger.Error(fmt.Sprintf("Failed to parse request: %v", err))
 		c.JSON(http.StatusBadRequest, ErrorResponse{
 			Error: fmt.Sprintf("Invalid request: %v", err),
 		})
@@ -270,18 +273,23 @@ func HandleMessagesMonica(c *gin.Context) {
 	}
 
 	if len(req.Messages) == 0 {
+		logger.Error("No messages provided in request")
 		c.JSON(http.StatusBadRequest, ErrorResponse{
 			Error: "No messages provided",
 		})
 		return
 	}
 
+	logger.Info(fmt.Sprintf("Processing %d messages", len(req.Messages)))
+
 	// Process messages into prompt and extract images
 	processor := utils.NewChatRequestProcessor()
 	processor.ProcessMessages(req.Messages)
+	logger.Info(fmt.Sprintf("Processed messages - prompt length: %d, images: %d", processor.Prompt.Len(), len(processor.ImgDataList)))
 
 	// Get model or use default
 	modelName := getModelOrDefault(req.Model)
+	logger.Info(fmt.Sprintf("Using model: %s, streaming: %v", modelName, req.Stream))
 	index := config.Sr.NextIndex()
 
 	// Attempt with retry mechanism
@@ -302,11 +310,12 @@ func HandleMessagesMonica(c *gin.Context) {
 
 		// Initialize client and process request
 		if handleClaudeMessagesRequest(c, session, modelName, processor, req.Stream) {
+			logger.Info("Request processed successfully")
 			return // Success, exit the retry loop
 		}
 
 		// If we're here, the request failed - retry with another session
-		logger.Info("Retrying another session")
+		logger.Info(fmt.Sprintf("Request failed, retrying with another session (attempt %d/%d)", i+2, config.ConfigInstance.RetryCount))
 	}
 
 	logger.Error("Failed for all retries")
